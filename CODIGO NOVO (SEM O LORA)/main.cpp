@@ -1,0 +1,418 @@
+#include <HX711_ADC.h>
+#if defined(ESP8266) || defined(ESP32) || defined(AVR)
+#include <EEPROM.h>
+#endif
+#include <SPI.h>
+#include <SD.h>
+#include "BluetoothSerial.h"
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include <MPU6050.h>
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run make menuconfig to and enable it
+#endif
+
+BluetoothSerial SerialBT;
+
+// GY-91 (MPU6050 + BMP280)
+MPU6050 mpu;
+Adafruit_BMP280 bmp;
+
+//pins:
+const int HX711_dout = 25;
+const int HX711_sck = 26;
+
+//SD card pins
+const int CS = 15;
+
+File myFile;
+
+//HX711 constructor:
+HX711_ADC LoadCell(HX711_dout, HX711_sck);
+
+const int calVal_eepromAdress = 0;
+unsigned long t = 0;
+
+void calibrate();
+void changeSavedCalFactor();
+void logToSD(float value, unsigned long timestamp);
+void iniciaSD(void);
+
+void setup() {
+  Serial.begin(57600);
+  SerialBT.begin("RocketWolf Static Test ESP32");
+  delay(10);
+  Serial.println();
+  Serial.println("Starting...");
+
+  Wire.begin(21, 22);  // SDA = 21, SCL = 22
+
+  // Inicialização do MPU6050
+  Serial.println("Inicializando MPU6050...");
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 falhou na conexão. (mas relaxa, ele ta funcionando sim kakaka)");
+  } else {
+    Serial.println("MPU6050 conectado com sucesso.");
+  }
+
+  // Inicialização do BMP280
+  Serial.println("Inicializando BMP280...");
+  if (!bmp.begin(0x76)) {
+    Serial.println("BMP280 não detectado. Verifique a conexão.");
+  } else {
+    Serial.println("BMP280 conectado com sucesso.");
+  }
+
+  LoadCell.begin();
+  unsigned long stabilizingtime = 2000;
+  boolean _tare = true;
+  LoadCell.start(stabilizingtime, _tare);
+  if (LoadCell.getTareTimeoutFlag() || LoadCell.getSignalTimeoutFlag()) {
+    Serial.println("Timeout, check MCU>HX711 wiring and pin designations");
+    SerialBT.println("Timeout, check MCU>HX711 wiring and pin designations");
+    while (1);
+  } else {
+    LoadCell.setCalFactor(1.0);
+    Serial.println("Startup is complete");
+    SerialBT.println("Startup is complete");
+  }
+  while (!LoadCell.update());
+
+  calibrate();
+
+  Serial.println("Initializing SD card...");
+  SerialBT.println("Initializing SD card...");
+  if (!SD.begin(CS)) {
+    Serial.println("initialization failed!");
+    SerialBT.println("initialization failed!");
+    return;
+  }
+  Serial.println("initialization done.");
+  SerialBT.println("initialization done.");
+  myFile = SD.open("/resultado.txt", FILE_WRITE);
+  if (myFile) {
+    myFile.println("Teste Iniciado");
+  }
+}
+
+void loop() {
+  static boolean newDataReady = 0;
+  const int serialPrintInterval = 0;
+
+  if (LoadCell.update()) newDataReady = true;
+
+  if (newDataReady) {
+    if (millis() > t + serialPrintInterval) {
+      float i = LoadCell.getData();
+      unsigned long currentMillis = millis();
+
+      // Leitura do GY-91
+      int16_t ax, ay, az, gx, gy, gz;
+      mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+      float temperature = bmp.readTemperature();
+      float pressure = bmp.readPressure() / 100.0F;
+
+      // SERIAL MONITOR
+      Serial.print("Tempo: ");
+      Serial.print(currentMillis);
+      Serial.print(" ms | Load_cell: ");
+      Serial.print(i);
+      Serial.print(" | Accel XYZ: ");
+      Serial.print(ax); Serial.print(", ");
+      Serial.print(ay); Serial.print(", ");
+      Serial.print(az);
+      Serial.print(" | Gyro XYZ: ");
+      Serial.print(gx); Serial.print(", ");
+      Serial.print(gy); Serial.print(", ");
+      Serial.print(gz);
+      Serial.print(" | Temp: ");
+      Serial.print(temperature);
+      Serial.print(" *C | Press: ");
+      Serial.print(pressure);
+      Serial.println(" hPa");
+
+      // BLUETOOTH
+      SerialBT.print("Tempo: ");
+      SerialBT.print(currentMillis);
+      SerialBT.print(" ms | Load_cell: ");
+      SerialBT.print(i);
+      SerialBT.print(" | Accel XYZ: ");
+      SerialBT.print(ax); SerialBT.print(", ");
+      SerialBT.print(ay); SerialBT.print(", ");
+      SerialBT.print(az);
+      SerialBT.print(" | Gyro XYZ: ");
+      SerialBT.print(gx); SerialBT.print(", ");
+      SerialBT.print(gy); SerialBT.print(", ");
+      SerialBT.print(gz);
+      SerialBT.print(" | Temp: ");
+      SerialBT.print(temperature);
+      SerialBT.print(" *C | Press: ");
+      SerialBT.print(pressure);
+      SerialBT.println(" hPa");
+
+      // LOG SD
+      logToSD(i, currentMillis);
+
+      newDataReady = 0;
+      t = millis();
+    }
+  }
+
+  if (Serial.available() > 0 || SerialBT.available() > 0) {
+    char inByte;
+    if (Serial.available() > 0) {
+      inByte = Serial.read();
+    } else if (SerialBT.available() > 0) {
+      inByte = SerialBT.read();
+    }
+    if (inByte == 't') LoadCell.tareNoDelay();
+    else if (inByte == 'r') calibrate();
+    else if (inByte == 'c') changeSavedCalFactor();
+  }
+
+  if (LoadCell.getTareStatus() == true) {
+    Serial.println("Tare complete");
+    SerialBT.println("Tare complete");
+  }
+}
+
+void calibrate() {
+  Serial.println("***");
+  Serial.println("Start calibration:");
+  Serial.println("Place the load cell on a level stable surface.");
+  Serial.println("Remove any load applied to the load cell.");
+  Serial.println("Send 't' from serial monitor to set the tare offset.");
+
+  SerialBT.println("***");
+  SerialBT.println("Start calibration:");
+  SerialBT.println("Place the load cell on a level stable surface.");
+  SerialBT.println("Remove any load applied to the load cell.");
+  SerialBT.println("Send 't' from serial monitor to set the tare offset.");
+
+  boolean _resume = false;
+  while (_resume == false) {
+    LoadCell.update();
+    if (Serial.available() > 0 || SerialBT.available() > 0) {
+      char inByte;
+      if (Serial.available() > 0) {
+        inByte = Serial.read();
+      } else if (SerialBT.available() > 0) {
+        inByte = SerialBT.read();
+      }
+      if (inByte == 't') LoadCell.tareNoDelay();
+    }
+    if (LoadCell.getTareStatus() == true) {
+      Serial.println("Tare complete");
+      SerialBT.println("Tare complete");
+      _resume = true;
+    }
+  }
+
+  Serial.println("Now, place your known mass on the load cell.");
+  Serial.println("Then send the weight of this mass (i.e. 100.0) from serial monitor.");
+  SerialBT.println("Now, place your known mass on the load cell.");
+  SerialBT.println("Then send the weight of this mass (i.e. 100.0) from serial monitor.");
+
+  float known_mass = 0;
+  _resume = false;
+  while (_resume == false) {
+    LoadCell.update();
+    if (Serial.available() > 0 || SerialBT.available() > 0) {
+      if (Serial.available() > 0) {
+        known_mass = Serial.parseFloat();
+      } else if (SerialBT.available() > 0) {
+        known_mass = SerialBT.parseFloat();
+      }
+      if (known_mass != 0) {
+        Serial.print("Known mass is: ");
+        Serial.println(known_mass);
+        SerialBT.print("Known mass is: ");
+        SerialBT.println(known_mass);
+        _resume = true;
+      }
+    }
+  }
+
+  LoadCell.refreshDataSet();
+  float newCalibrationValue = LoadCell.getNewCalibration(known_mass);
+
+  Serial.print("New calibration value has been set to: ");
+  Serial.print(newCalibrationValue);
+  Serial.println(", use this as calibration value (calFactor) in your project sketch.");
+  Serial.print("Save this value to EEPROM address ");
+  Serial.print(calVal_eepromAdress);
+  Serial.println("? y/n");
+
+  SerialBT.print("New calibration value has been set to: ");
+  SerialBT.print(newCalibrationValue);
+  SerialBT.println(", use this as calibration value (calFactor) in your project sketch.");
+  SerialBT.print("Save this value to EEPROM address ");
+  SerialBT.print(calVal_eepromAdress);
+  SerialBT.println("? y/n");
+
+  _resume = false;
+  while (_resume == false) {
+    if (Serial.available() > 0 || SerialBT.available() > 0) {
+      char inByte;
+      if (Serial.available() > 0) {
+        inByte = Serial.read();
+      } else if (SerialBT.available() > 0) {
+        inByte = SerialBT.read();
+      }
+      if (inByte == 'y') {
+#if defined(ESP8266) || defined(ESP32)
+        EEPROM.begin(512);
+#endif
+        EEPROM.put(calVal_eepromAdress, newCalibrationValue);
+#if defined(ESP8266) || defined(ESP32)
+        EEPROM.commit();
+#endif
+        EEPROM.get(calVal_eepromAdress, newCalibrationValue);
+        Serial.print("Value ");
+        Serial.print(newCalibrationValue);
+        Serial.print(" saved to EEPROM address: ");
+        Serial.println(calVal_eepromAdress);
+        SerialBT.print("Value ");
+        SerialBT.print(newCalibrationValue);
+        SerialBT.print(" saved to EEPROM address: ");
+        SerialBT.println(calVal_eepromAdress);
+        _resume = true;
+      } else if (inByte == 'n') {
+        Serial.println("Value not saved to EEPROM");
+        SerialBT.println("Value not saved to EEPROM");
+        _resume = true;
+      }
+    }
+  }
+
+  Serial.println("End calibration");
+  Serial.println("***");
+  Serial.println("To re-calibrate, send 'r' from serial monitor.");
+  Serial.println("For manual edit of the calibration value, send 'c' from serial monitor.");
+  Serial.println("***");
+
+  SerialBT.println("End calibration");
+  SerialBT.println("***");
+  SerialBT.println("To re-calibrate, send 'r' from serial monitor.");
+  SerialBT.println("For manual edit of the calibration value, send 'c' from serial monitor.");
+  SerialBT.println("***");
+}
+
+void changeSavedCalFactor() {
+  float oldCalibrationValue = LoadCell.getCalFactor();
+  boolean _resume = false;
+  Serial.println("***");
+  Serial.print("Current value is: ");
+  Serial.println(oldCalibrationValue);
+  Serial.println("Now, send the new value from serial monitor, i.e. 696.0");
+
+  SerialBT.println("***");
+  SerialBT.print("Current value is: ");
+  SerialBT.println(oldCalibrationValue);
+  SerialBT.println("Now, send the new value from serial monitor, i.e. 696.0");
+
+  float newCalibrationValue;
+  while (_resume == false) {
+    if (Serial.available() > 0 || SerialBT.available() > 0) {
+      if (Serial.available() > 0) {
+        newCalibrationValue = Serial.parseFloat();
+      } else if (SerialBT.available() > 0) {
+        newCalibrationValue = SerialBT.parseFloat();
+      }
+      if (newCalibrationValue != 0) {
+        Serial.print("New calibration value is: ");
+        Serial.println(newCalibrationValue);
+        SerialBT.print("New calibration value is: ");
+        SerialBT.println(newCalibrationValue);
+        LoadCell.setCalFactor(newCalibrationValue);
+        _resume = true;
+      }
+    }
+  }
+
+  _resume = false;
+  Serial.print("Save this value to EEPROM address ");
+  Serial.print(calVal_eepromAdress);
+  Serial.println("? y/n");
+
+  SerialBT.print("Save this value to EEPROM address ");
+  SerialBT.print(calVal_eepromAdress);
+  SerialBT.println("? y/n");
+
+  while (_resume == false) {
+    if (Serial.available() > 0 || SerialBT.available() > 0) {
+      char inByte;
+      if (Serial.available() > 0) {
+        inByte = Serial.read();
+      } else if (SerialBT.available() > 0) {
+        inByte = SerialBT.read();
+      }
+      if (inByte == 'y') {
+#if defined(ESP8266) || defined(ESP32)
+        EEPROM.begin(512);
+#endif
+        EEPROM.put(calVal_eepromAdress, newCalibrationValue);
+#if defined(ESP8266) || defined(ESP32)
+        EEPROM.commit();
+#endif
+        EEPROM.get(calVal_eepromAdress, newCalibrationValue);
+        Serial.print("Value ");
+        Serial.print(newCalibrationValue);
+        Serial.print(" saved to EEPROM address: ");
+        Serial.println(calVal_eepromAdress);
+        SerialBT.print("Value ");
+        SerialBT.print(newCalibrationValue);
+        SerialBT.print(" saved to EEPROM address: ");
+        SerialBT.println(calVal_eepromAdress);
+        _resume = true;
+      } else if (inByte == 'n') {
+        Serial.println("Value not saved to EEPROM");
+        SerialBT.println("Value not saved to EEPROM");
+        _resume = true;
+      }
+    }
+  }
+
+  Serial.println("End change calibration value");
+  Serial.println("***");
+
+  SerialBT.println("End change calibration value");
+  SerialBT.println("***");
+}
+
+void logToSD(float value, unsigned long timestamp) {
+  if (myFile) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    float temperature = bmp.readTemperature();
+    float pressure = bmp.readPressure() / 100.0F;
+
+    myFile.print("Tempo: ");
+    myFile.print(timestamp);
+    myFile.print(" ms | Load_cell: ");
+    myFile.print(value);
+    myFile.print(" | Accel XYZ: ");
+    myFile.print(ax); myFile.print(", ");
+    myFile.print(ay); myFile.print(", ");
+    myFile.print(az);
+    myFile.print(" | Gyro XYZ: ");
+    myFile.print(gx); myFile.print(", ");
+    myFile.print(gy); myFile.print(", ");
+    myFile.print(gz);
+    myFile.print(" | Temp: ");
+    myFile.print(temperature);
+    myFile.print(" *C | Press: ");
+    myFile.print(pressure);
+    myFile.println(" hPa");
+
+    myFile.flush();
+  }
+}
+
+void iniciaSD(void) {
+  myFile = SD.open("/resultado.txt", FILE_WRITE);
+}
